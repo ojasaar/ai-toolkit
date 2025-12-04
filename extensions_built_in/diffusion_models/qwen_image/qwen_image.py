@@ -1,4 +1,5 @@
 import os
+import math
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -36,19 +37,20 @@ if TYPE_CHECKING:
 
 scheduler_config = {
     "base_image_seq_len": 256,
-    "base_shift": 0.5,
+    "base_shift": math.log(3),  # shift=3 to match Lightning LoRA distillation
     "invert_sigmas": False,
     "max_image_seq_len": 8192,
-    "max_shift": 0.9,
+    "max_shift": math.log(3),  # shift=3 to match Lightning LoRA distillation
     "num_train_timesteps": 1000,
     "shift": 1.0,
-    "shift_terminal": 0.02,
+    "shift_terminal": None,  # None to match Lightning LoRA
     "stochastic_sampling": False,
     "time_shift_type": "exponential",
     "use_beta_sigmas": False,
-    "use_dynamic_shifting": True,
+    "use_dynamic_shifting": True,  # Enable dynamic shifting to match Lightning LoRA
     "use_exponential_sigmas": False,
     "use_karras_sigmas": False,
+    "fixed_exponential_mu": math.log(3),  # mu=log(3)≈1.099 for shift=3 (matches Lightning LoRA)
 }
 
 
@@ -223,6 +225,27 @@ class QwenImageModel(BaseModel):
         self.tokenizer = tokenizer  # list of tokenizers
         self.model = pipe.transformer
         self.pipeline = pipe
+
+        # Load assistant/inference LoRA if specified (used during sampling only)
+        # inference_lora_path: OFF during training, ON during sampling (for Lightning LoRA)
+        # assistant_lora_path: behavior depends on invert_assistant_lora flag
+        if self.model_config.inference_lora_path is not None:
+            self.print_and_status_update("Loading inference LoRA (Lightning)")
+            from toolkit.assistant_lora import load_assistant_lora_from_path
+            self.assistant_lora = load_assistant_lora_from_path(
+                self.model_config.inference_lora_path, self
+            )
+            # Disable during training, will be enabled during sampling
+            self.assistant_lora.is_active = False
+        elif self.model_config.assistant_lora_path is not None:
+            self.print_and_status_update("Loading assistant LoRA")
+            from toolkit.assistant_lora import load_assistant_lora_from_path
+            self.assistant_lora = load_assistant_lora_from_path(
+                self.model_config.assistant_lora_path, self
+            )
+            # Behavior controlled by invert_assistant_lora in generate_images
+            self.assistant_lora.is_active = False
+
         self.print_and_status_update("Model Loaded")
 
     def get_generation_pipeline(self):
@@ -404,6 +427,9 @@ class QwenImageModel(BaseModel):
         new_sd = {}
         for key, value in state_dict.items():
             new_key = key.replace("diffusion_model.", "transformer.")
+            # Handle Lightning LoRA format: add transformer. prefix if missing
+            if new_key.startswith("transformer_blocks."):
+                new_key = "transformer." + new_key
             new_sd[new_key] = value
         return new_sd
 

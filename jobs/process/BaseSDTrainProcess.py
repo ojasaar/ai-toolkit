@@ -784,6 +784,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def hook_after_sd_init_before_load(self):
         pass
 
+    def hook_log_loss(self, step, loss_dict, learning_rate):
+        # Override in subclass to capture loss data (e.g., for UI graphs)
+        pass
+
     def get_latest_save_path(self, name=None, post=''):
         if name == None:
             name = self.job.name
@@ -2221,6 +2225,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.progress_bar is not None:
                         self.progress_bar.set_postfix_str(prog_bar_string)
 
+                    # Log loss data every step for UI graphs (independent of TensorBoard logging)
+                    if self.accelerator.is_main_process:
+                        self.hook_log_loss(self.step_num, loss_dict, learning_rate)
+
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
                 if isinstance(batch, DataLoaderBatchDTO):
                     with self.timer('batch_cleanup'):
@@ -2275,7 +2283,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     self.writer.add_scalar(f"lr", learning_rate, self.step_num)
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
-                        
+
                         if self.accelerator.is_main_process:
                             # log to logger
                             self.logger.log({

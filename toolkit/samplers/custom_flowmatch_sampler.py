@@ -22,6 +22,9 @@ def calculate_shift(
 
 class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(self, *args, **kwargs):
+        # Extract custom parameters not recognized by parent class
+        self._fixed_exponential_mu = kwargs.pop('fixed_exponential_mu', None)
+
         super().__init__(*args, **kwargs)
         self.init_noise_sigma = 1.0
         self.timestep_type = "linear"
@@ -140,6 +143,9 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
             sigmas = timesteps / self.config.num_train_timesteps
 
+            # Check for fixed exponential mu (e.g., Qwen uses fixed mu=0.8)
+            fixed_exponential_mu = self._fixed_exponential_mu
+
             if self.config.use_dynamic_shifting:
                 if latents is None:
                     raise ValueError('latents is None')
@@ -157,11 +163,19 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                     self.config.get("max_shift", 1.16),
                 )
                 sigmas = self.time_shift(mu, 1.0, sigmas)
+                print(f"[SCHEDULER] Dynamic shift: image_seq_len={image_seq_len}, mu={mu:.4f}")
+            elif fixed_exponential_mu is not None:
+                # Use fixed exponential mu (like DiffSynth's approach)
+                mu = fixed_exponential_mu
+                sigmas = self.time_shift(mu, 1.0, sigmas)
+                print(f"[SCHEDULER] Fixed exponential shift: mu={mu:.4f}")
             else:
                 sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
+                print(f"[SCHEDULER] Linear shift: shift={self.shift}")
 
             if self.config.shift_terminal:
                 sigmas = self.stretch_shift_to_terminal(sigmas)
+                print(f"[SCHEDULER] Applied shift_terminal: {self.config.shift_terminal}")
 
             if self.config.use_karras_sigmas:
                 sigmas = self._convert_to_karras(
@@ -190,6 +204,7 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             self.sigmas = sigmas
 
             self.timesteps = timesteps.to(device=device)
+            print(f"[SCHEDULER] Timestep range: [{self.timesteps.min().item():.2f}, {self.timesteps.max().item():.2f}], num_timesteps={len(self.timesteps)}")
             return timesteps
 
         elif timestep_type == 'lognorm_blend':

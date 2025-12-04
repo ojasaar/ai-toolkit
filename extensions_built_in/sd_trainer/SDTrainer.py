@@ -1,3 +1,4 @@
+import json
 import os
 import random
 from collections import OrderedDict
@@ -242,8 +243,42 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
+    def _cleanup_loss_data_on_resume(self):
+        """Remove loss entries >= start_step when resuming from checkpoint.
+
+        When resuming from step N, we keep entries for steps < N (prior steps)
+        and remove entries >= N (will be re-run, including step N itself).
+        """
+        if not hasattr(self, 'loss_data_file') or not os.path.exists(self.loss_data_file):
+            return
+
+        try:
+            # Read existing entries, keep only steps < start_step
+            entries = []
+            with open(self.loss_data_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entry = json.loads(line)
+                        if entry.get('step', 0) < self.start_step:
+                            entries.append(line)
+
+            # Rewrite file with filtered entries
+            with open(self.loss_data_file, 'w') as f:
+                for entry in entries:
+                    f.write(entry + '\n')
+
+            print(f"Cleared loss data from step {self.start_step} onwards for resume")
+        except Exception as e:
+            print(f"Warning: Failed to cleanup loss data: {e}")
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
+
+        # Clean up loss data when resuming from checkpoint
+        if self.start_step > 0:
+            self._cleanup_loss_data_on_resume()
+
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -278,6 +313,30 @@ class SDTrainer(BaseSDTrainProcess):
             self.sd.vae.to('cpu')
             flush()
         add_all_snr_to_noise_scheduler(self.sd.noise_scheduler, self.device_torch)
+
+        # Log training configuration for flow matching models
+        if self.sd.is_flow_matching:
+            do_weighted_timesteps = (
+                self.train_config.linear_timesteps or
+                self.train_config.linear_timesteps2 or
+                self.train_config.timestep_type == "weighted"
+            )
+            weight_type = "BSMNTW (Bell-Shaped)" if self.train_config.linear_timesteps else \
+                          "HBSMNTW (Half-Bell)" if self.train_config.linear_timesteps2 else \
+                          "Predefined weights" if self.train_config.timestep_type == "weighted" else \
+                          "None (uniform)"
+            print(f"[TRAINING CONFIG] Flow matching model detected")
+            print(f"[TRAINING CONFIG] Timestep type: {self.train_config.timestep_type}")
+            print(f"[TRAINING CONFIG] Content/style sampling: {self.train_config.content_or_style}")
+            print(f"[TRAINING CONFIG] Loss weighting enabled: {do_weighted_timesteps}")
+            print(f"[TRAINING CONFIG] Loss weight type: {weight_type}")
+            if hasattr(self.sd.noise_scheduler, '_fixed_exponential_mu') and self.sd.noise_scheduler._fixed_exponential_mu:
+                print(f"[TRAINING CONFIG] Fixed exponential mu: {self.sd.noise_scheduler._fixed_exponential_mu}")
+            if hasattr(self.sd.noise_scheduler, 'config'):
+                sched_config = self.sd.noise_scheduler.config
+                if hasattr(sched_config, 'shift_terminal') and sched_config.shift_terminal:
+                    print(f"[TRAINING CONFIG] Shift terminal: {sched_config.shift_terminal}")
+
         if self.adapter is not None:
             self.adapter.to(self.device_torch)
 
@@ -1097,8 +1156,18 @@ class SDTrainer(BaseSDTrainProcess):
                     embeds_to_use = batch.prompt_embeds.clone().to(self.device_torch, dtype=dtype)
                 else:
                     prompt_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
-                        prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    if self.sd.encode_control_in_text_embeddings:
+                        # Handle both single control tensor and list of control tensors
+                        if batch.control_tensor is not None:
+                            prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            print(f"[TRAIN-CACHE] Control images (single tensor) shape: {prompt_kwargs['control_images'].shape}")
+                        elif hasattr(batch, 'control_tensor_list') and batch.control_tensor_list is not None:
+                            # control_tensor_list is a list of lists (one per batch item)
+                            # For batch_size=1, just take the first item's control tensors
+                            control_list = batch.control_tensor_list[0] if len(batch.control_tensor_list) > 0 else []
+                            # Add batch dimension if needed (shape should be batch, channels, height, width)
+                            prompt_kwargs['control_images'] = [t.unsqueeze(0).to(self.sd.device_torch, dtype=self.sd.torch_dtype) if t.dim() == 3 else t.to(self.sd.device_torch, dtype=self.sd.torch_dtype) for t in control_list]
+                            print(f"[TRAIN-CACHE] Control images (list) count: {len(prompt_kwargs['control_images'])}, shapes: {[img.shape for img in prompt_kwargs['control_images']]}")
                     embeds_to_use = self.sd.encode_prompt(
                         prompt_list,
                         long_prompts=self.do_long_prompts).to(
@@ -1216,6 +1285,7 @@ class SDTrainer(BaseSDTrainProcess):
                     self.sd.text_encoder.to(self.sd.te_torch_dtype)
 
             noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
+            print(f"[TRAIN] Noisy latents shape: {noisy_latents.shape}, timesteps: {timesteps.shape}")
             if self.train_config.do_cfg or self.train_config.do_random_cfg:
                 # pick random negative prompts
                 if self.negative_prompt_pool is not None:
@@ -1485,8 +1555,18 @@ class SDTrainer(BaseSDTrainProcess):
                 with self.timer('encode_prompt'):
                     unconditional_embeds = None
                     prompt_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
-                        prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    if self.sd.encode_control_in_text_embeddings:
+                        # Handle both single control tensor and list of control tensors
+                        if batch.control_tensor is not None:
+                            prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            print(f"[TRAIN] Control images (single tensor) shape: {prompt_kwargs['control_images'].shape}")
+                        elif hasattr(batch, 'control_tensor_list') and batch.control_tensor_list is not None:
+                            # control_tensor_list is a list of lists (one per batch item)
+                            # For batch_size=1, just take the first item's control tensors
+                            control_list = batch.control_tensor_list[0] if len(batch.control_tensor_list) > 0 else []
+                            # Add batch dimension if needed (shape should be batch, channels, height, width)
+                            prompt_kwargs['control_images'] = [t.unsqueeze(0).to(self.sd.device_torch, dtype=self.sd.torch_dtype) if t.dim() == 3 else t.to(self.sd.device_torch, dtype=self.sd.torch_dtype) for t in control_list]
+                            print(f"[TRAIN] Control images (list) count: {len(prompt_kwargs['control_images'])}, shapes: {[img.shape for img in prompt_kwargs['control_images']]}")
                     if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
                         with torch.set_grad_enabled(False):
                             if batch.prompt_embeds is not None:
@@ -1943,6 +2023,7 @@ class SDTrainer(BaseSDTrainProcess):
                     )
                 else:
                     with self.timer('predict_unet'):
+                        print(f"[TRAIN] Sending to model - noisy_latents shape: {noisy_latents.shape}")
                         noise_pred = self.predict_noise(
                             noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
                             timesteps=timesteps,

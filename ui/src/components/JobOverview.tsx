@@ -4,6 +4,7 @@ import useCPUInfo from '@/hooks/useCPUInfo';
 import GPUWidget from '@/components/GPUWidget';
 import CPUWidget from '@/components/CPUWidget';
 import FilesWidget from '@/components/FilesWidget';
+import LossGraph from '@/components/LossGraph';
 import { getTotalSteps } from '@/utils/jobs';
 import { Cpu, HardDrive, Info, Gauge } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -133,6 +134,9 @@ export default function JobOverview({ job }: JobOverviewProps) {
               </div>
             </div>
           </div>
+
+          {/* Loss Graph */}
+          <LossGraph jobID={job.id} refreshInterval={5000} />
 
           {/* Log - Now using flex-grow to fill remaining space */}
           <div className="bg-gray-950 rounded-lg p-4 relative flex-grow min-h-60">

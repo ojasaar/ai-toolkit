@@ -100,14 +100,24 @@ class QwenImageEditPlusCustomPipeline(QwenImageEditPlusPipeline):
             condition_images = []
             vae_image_sizes = []
             vae_images = []
-            for img in image:
+            for img_idx, img in enumerate(image):
                 image_width, image_height = img.size
                 condition_width, condition_height = calculate_dimensions(
                     CONDITION_IMAGE_SIZE, image_width / image_height
                 )
-                vae_width, vae_height = calculate_dimensions(
-                    VAE_IMAGE_SIZE, image_width / image_height
-                )
+
+                # First control (source) must match target dimensions
+                # Other controls (references) can use VAE_IMAGE_SIZE
+                if img_idx == 0:
+                    # Use target dimensions for first control
+                    vae_width = width
+                    vae_height = height
+                else:
+                    # Use VAE_IMAGE_SIZE for reference images
+                    vae_width, vae_height = calculate_dimensions(
+                        VAE_IMAGE_SIZE, image_width / image_height
+                    )
+
                 condition_image_sizes.append((condition_width, condition_height))
                 vae_image_sizes.append((vae_width, vae_height))
                 condition_images.append(
@@ -118,6 +128,8 @@ class QwenImageEditPlusCustomPipeline(QwenImageEditPlusPipeline):
                         img, vae_height, vae_width
                     ).unsqueeze(2)
                 )
+            print(f"[PIPELINE] VAE image sizes (HxW): {[(h, w) for w, h in vae_image_sizes]}, tensor shapes: {[v.shape for v in vae_images]}")
+            print(f"[PIPELINE] First control (source) matches target: {vae_image_sizes[0] == (width, height)}")
 
         has_neg_prompt = negative_prompt is not None or (
             negative_prompt_embeds is not None
@@ -167,6 +179,7 @@ class QwenImageEditPlusCustomPipeline(QwenImageEditPlusPipeline):
             generator,
             latents,
         )
+        print(f"[PIPELINE] After prepare_latents - latents: {latents.shape}, image_latents: {image_latents.shape if image_latents is not None else None}")
         img_shapes = [
             [
                 (
@@ -256,6 +269,8 @@ class QwenImageEditPlusCustomPipeline(QwenImageEditPlusPipeline):
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                if i == 0:  # Only log on first step to avoid spam
+                    print(f"[PIPELINE] Before transformer - latent_model_input: {latent_model_input.shape}, img_shapes: {img_shapes}")
                 with self.transformer.cache_context("cond"):
                     noise_pred = self.transformer(
                         hidden_states=latent_model_input,

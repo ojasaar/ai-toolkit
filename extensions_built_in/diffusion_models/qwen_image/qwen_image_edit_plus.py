@@ -133,6 +133,7 @@ class QwenImageEditPlusModel(QwenImageModel):
 
             return {"latents": latents}
 
+        print(f"[SAMPLE] Generating image - size: {gen_config.width}x{gen_config.height}, control images: {len(control_img_list)}")
         img = pipeline(
             image=control_img_list,
             prompt_embeds=conditional_embeds.text_embeds,
@@ -168,23 +169,29 @@ class QwenImageEditPlusModel(QwenImageModel):
             
         if control_images is None:
             raise ValueError("Missing control images for QwenImageEditPlusModel")
-        
+
         if not isinstance(control_images, List):
             control_images = [control_images]
+
+        print(f"[MODEL] Received control images - count: {len(control_images)}, input shapes: {[img.shape for img in control_images]}")
 
         if control_images is not None and len(control_images) > 0:
             for i in range(len(control_images)):
                 # control images are 0 - 1 scale, shape (bs, ch, height, width)
-                ratio = control_images[i].shape[2] / control_images[i].shape[3]
+                # Aspect-ratio-preserving resize using calculate_dimensions logic
+                ratio = control_images[i].shape[3] / control_images[i].shape[2]  # width / height
                 width = math.sqrt(CONDITION_IMAGE_SIZE * ratio)
                 height = width / ratio
 
-                width = round(width / 32) * 32
-                height = round(height / 32) * 32
+                # Round to multiples of 32
+                width = int(round(width / 32) * 32)
+                height = int(round(height / 32) * 32)
 
                 control_images[i] = F.interpolate(
                     control_images[i], size=(height, width), mode="bilinear"
                 )
+
+        print(f"[MODEL] After resize - shapes: {[img.shape for img in control_images]}")
 
         prompt_embeds, prompt_embeds_mask = self.pipeline.encode_prompt(
             prompt,
@@ -206,9 +213,10 @@ class QwenImageEditPlusModel(QwenImageModel):
     ):
         with torch.no_grad():
             batch_size, num_channels_latents, height, width = latent_model_input.shape
+            print(f"[MODEL] Received latent_model_input shape: {latent_model_input.shape}")
             if self.vae.device != self.device_torch:
                 self.vae.to(self.device_torch)
-            
+
             control_image_res = VAE_IMAGE_SIZE
             if self.model_config.model_kwargs.get("match_target_res", False):
                 # use the current target size to set the control image res
@@ -222,6 +230,7 @@ class QwenImageEditPlusModel(QwenImageModel):
             latent_model_input = latent_model_input.reshape(
                 batch_size, (height // 2) * (width // 2), num_channels_latents * 4
             )
+            print(f"[MODEL] After packing - latent shape: {latent_model_input.shape}")
 
             raw_packed_latents = latent_model_input
 
@@ -238,17 +247,35 @@ class QwenImageEditPlusModel(QwenImageModel):
             packed_latents_list = torch.chunk(latent_model_input, batch_size, dim=0)
             packed_latents_with_controls_list = []
 
+            print(f"[MODEL] batch.control_tensor_list is None: {batch.control_tensor_list is None}, batch.control_tensor is None: {batch.control_tensor is None}")
+
+            # Handle both control_tensor_list (multiple control images) and control_tensor (single control image)
+            control_tensors_to_process = None
             if batch.control_tensor_list is not None:
-                if len(batch.control_tensor_list) != batch_size:
+                control_tensors_to_process = batch.control_tensor_list
+                print(f"[MODEL] Using control_tensor_list with {len(batch.control_tensor_list)} batches")
+            elif batch.control_tensor is not None:
+                # Convert single control_tensor to list format
+                # control_tensor is shape (batch_size, ch, h, w) or (ch, h, w)
+                print(f"[MODEL] Using control_tensor (single control image), shape: {batch.control_tensor.shape}")
+                control_img = batch.control_tensor
+                if len(control_img.shape) == 3:
+                    # Add batch dimension
+                    control_img = control_img.unsqueeze(0)
+                # Convert to list of lists for consistency with control_tensor_list
+                control_tensors_to_process = [[control_img[i]] for i in range(control_img.shape[0])]
+
+            if control_tensors_to_process is not None:
+                if len(control_tensors_to_process) != batch_size:
                     raise ValueError(
                         "Control tensor list length does not match batch size"
                     )
                 b = 0
-                for control_tensor_list in batch.control_tensor_list:
+                for control_tensor_list in control_tensors_to_process:
                     # control tensor list is a list of tensors for this batch item
                     controls = []
                     # pack control
-                    for control_img in control_tensor_list:
+                    for control_idx, control_img in enumerate(control_tensor_list):
                         # control images are 0 - 1 scale, shape (1, ch, height, width)
                         control_img = control_img.to(
                             self.device_torch, dtype=self.torch_dtype
@@ -256,20 +283,39 @@ class QwenImageEditPlusModel(QwenImageModel):
                         # if it is only 3 dim, add batch dim
                         if len(control_img.shape) == 3:
                             control_img = control_img.unsqueeze(0)
-                        ratio = control_img.shape[2] / control_img.shape[3]
-                        c_width = math.sqrt(control_image_res * ratio)
-                        c_height = c_width / ratio
 
-                        c_width = round(c_width / 32) * 32
-                        c_height = round(c_height / 32) * 32
+                        # All control images use aspect-ratio-preserving resize
+                        # Same calculate_dimensions logic as dataloader and diffusers
+                        ratio = control_img.shape[3] / control_img.shape[2]  # width / height
+
+                        if control_idx == 0:
+                            # Source image: use same max_pixels as target (from bucketing resolution)
+                            # This ensures source is processed with same constraints as target
+                            target_max_pixels = (height * self.pipeline.vae_scale_factor) * (width * self.pipeline.vae_scale_factor)
+                            c_width = math.sqrt(target_max_pixels * ratio)
+                            c_height = c_width / ratio
+                            control_type = "source"
+                        else:
+                            # Reference images: use VAE_IMAGE_SIZE
+                            c_width = math.sqrt(control_image_res * ratio)
+                            c_height = c_width / ratio
+                            control_type = f"reference #{control_idx}"
+
+                        # Round to multiples of 32
+                        c_width = int(round(c_width / 32) * 32)
+                        c_height = int(round(c_height / 32) * 32)
+
+                        print(f"[MODEL] Control image {control_idx} ({control_type}): {control_img.shape[3]}x{control_img.shape[2]} (ratio {ratio:.3f}) -> {c_width}x{c_height} (aspect preserved, max_px={'target' if control_idx == 0 else 'VAE_IMAGE_SIZE'})")
 
                         control_img = F.interpolate(
-                            control_img, size=(c_height, c_width), mode="bilinear"
+                            control_img, size=(int(c_height), int(c_width)), mode="bilinear"
                         )
 
                         # scale to -1 to 1
                         control_img = control_img * 2 - 1
 
+                        control_type = "source (matches target)" if control_idx == 0 else f"reference #{control_idx}"
+                        print(f"[MODEL] Control image {control_idx} ({control_type}) before VAE encode: {control_img.shape}")
                         control_latent = self.encode_images(
                             control_img,
                             device=self.device_torch,
@@ -279,6 +325,7 @@ class QwenImageEditPlusModel(QwenImageModel):
                         clb, cl_num_channels_latents, cl_height, cl_width = (
                             control_latent.shape
                         )
+                        print(f"[MODEL] Control latent after VAE encode: {control_latent.shape}")
 
                         control = control_latent.view(
                             1,
@@ -325,6 +372,7 @@ class QwenImageEditPlusModel(QwenImageModel):
                 self.device_torch, dtype=torch.int64
             )
 
+        print(f"[MODEL] Transformer input - latent_model_input shape: {latent_model_input.shape}, img_shapes: {img_shapes}")
         noise_pred = self.transformer(
             hidden_states=latent_model_input.to(
                 self.device_torch, self.torch_dtype
@@ -347,4 +395,5 @@ class QwenImageEditPlusModel(QwenImageModel):
         )
         noise_pred = noise_pred.permute(0, 3, 1, 4, 2, 5)
         noise_pred = noise_pred.reshape(batch_size, num_channels_latents, height, width)
+        print(f"[MODEL] Returning noise_pred shape: {noise_pred.shape}")
         return noise_pred
