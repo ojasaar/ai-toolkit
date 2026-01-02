@@ -246,32 +246,20 @@ class QwenImageEditPlusModel(QwenImageModel):
             # split the latents into batch items so we can concat the controls
             packed_latents_list = torch.chunk(latent_model_input, batch_size, dim=0)
             packed_latents_with_controls_list = []
+            
+            batch_control_tensor_list = batch.control_tensor_list
+            if batch_control_tensor_list is None and batch.control_tensor is not None:
+                batch_control_tensor_list = []
+                for b in range(batch_size):
+                    batch_control_tensor_list.append([batch.control_tensor[b : b + 1]])
 
             print(f"[MODEL] batch.control_tensor_list is None: {batch.control_tensor_list is None}, batch.control_tensor is None: {batch.control_tensor is None}")
+            if batch_control_tensor_list is not None:
+                print(f"[MODEL] Using batch_control_tensor_list with {len(batch_control_tensor_list)} batches")
 
-            # Handle both control_tensor_list (multiple control images) and control_tensor (single control image)
-            control_tensors_to_process = None
-            if batch.control_tensor_list is not None:
-                control_tensors_to_process = batch.control_tensor_list
-                print(f"[MODEL] Using control_tensor_list with {len(batch.control_tensor_list)} batches")
-            elif batch.control_tensor is not None:
-                # Convert single control_tensor to list format
-                # control_tensor is shape (batch_size, ch, h, w) or (ch, h, w)
-                print(f"[MODEL] Using control_tensor (single control image), shape: {batch.control_tensor.shape}")
-                control_img = batch.control_tensor
-                if len(control_img.shape) == 3:
-                    # Add batch dimension
-                    control_img = control_img.unsqueeze(0)
-                # Convert to list of lists for consistency with control_tensor_list
-                control_tensors_to_process = [[control_img[i]] for i in range(control_img.shape[0])]
-
-            if control_tensors_to_process is not None:
-                if len(control_tensors_to_process) != batch_size:
-                    raise ValueError(
-                        "Control tensor list length does not match batch size"
-                    )
+            if batch_control_tensor_list is not None:
                 b = 0
-                for control_tensor_list in control_tensors_to_process:
+                for control_tensor_list in batch_control_tensor_list:
                     # control tensor list is a list of tensors for this batch item
                     controls = []
                     # pack control

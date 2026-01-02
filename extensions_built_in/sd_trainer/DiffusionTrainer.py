@@ -8,8 +8,6 @@ from typing import Literal, Optional
 import threading
 import time
 import signal
-import json
-from datetime import datetime
 
 AITK_Status = Literal["running", "stopped", "error", "completed"]
 
@@ -29,10 +27,6 @@ class DiffusionTrainer(SDTrainer):
             self.is_ui_trainer = False
         else:
             print(f"Job ID: \"{self.job_id}\"")
-        
-        # Initialize loss data file for UI graph (always, not just for UI trainer)
-        self.loss_data_file = os.path.join(self.save_root, "loss_data.jsonl")
-        print(f"Loss data will be written to: {self.loss_data_file}")
 
         if self.is_ui_trainer:
             self.is_stopping = False
@@ -319,31 +313,3 @@ class DiffusionTrainer(SDTrainer):
         super().save(step)
         self.maybe_stop()
         self.update_status("running", "Training")
-
-    def hook_log_loss(self, step, loss_dict, learning_rate):
-        """Write loss data to JSONL file for UI graph"""
-        if not self.accelerator.is_main_process:
-            return
-
-        try:
-            # Extract the main loss value (usually just "loss" key)
-            loss_value = loss_dict.get("loss", 0.0)
-            if isinstance(loss_value, dict):
-                # If loss_dict contains nested dicts, get the first value
-                loss_value = next(iter(loss_value.values()), 0.0)
-
-            # Create loss entry
-            loss_entry = {
-                "step": step,
-                "loss": float(loss_value),
-                "learning_rate": float(learning_rate),
-                "timestamp": datetime.now().isoformat()
-            }
-
-            # Append to JSONL file (each line is a JSON object)
-            with open(self.loss_data_file, "a") as f:
-                f.write(json.dumps(loss_entry) + "\n")
-
-        except Exception as e:
-            # Don't crash training if loss logging fails
-            print(f"Warning: Failed to write loss data: {e}")
