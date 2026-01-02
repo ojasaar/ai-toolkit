@@ -24,6 +24,119 @@ from diffusers.pipelines.qwenimage.pipeline_output import QwenImagePipelineOutpu
 
 
 class QwenImageEditPlusCustomPipeline(QwenImageEditPlusPipeline):
+    def _find_template_end(self, input_ids):
+        """
+        Find template end by counting <|im_start|> tokens (151644).
+        Matches ComfyUI's dynamic detection in qwen_image.py:61-77
+        """
+        count_im_start = 0
+        template_end = 0
+        for i in range(input_ids.shape[1]):
+            token_id = input_ids[0, i].item()
+            if token_id == 151644:  # <|im_start|>
+                if count_im_start < 2:
+                    template_end = i
+                    count_im_start += 1
+
+        # Check for "user\n" pattern (tokens 872, 198) after 2nd <|im_start|>
+        if input_ids.shape[1] > template_end + 3:
+            if input_ids[0, template_end + 1].item() == 872:  # "user"
+                if input_ids[0, template_end + 2].item() == 198:  # "\n"
+                    template_end += 3
+
+        return template_end
+
+    def _get_qwen_prompt_embeds(
+        self,
+        prompt,
+        image=None,
+        device=None,
+        dtype=None,
+    ):
+        """
+        Override parent method to use dynamic template end detection.
+        This matches ComfyUI's approach instead of using fixed drop_idx=64.
+        """
+        device = device or self._execution_device
+        dtype = dtype or self.text_encoder.dtype
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
+        if isinstance(image, list):
+            base_img_prompt = ""
+            for i, img in enumerate(image):
+                base_img_prompt += img_prompt_template.format(i + 1)
+        elif image is not None:
+            base_img_prompt = img_prompt_template.format(1)
+        else:
+            base_img_prompt = ""
+
+        template = self.prompt_template_encode
+        txt = [template.format(base_img_prompt + e) for e in prompt]
+
+        # Convert tensors to PIL images for the processor
+        # The processor expects PIL images or HWC numpy arrays, not BCHW tensors
+        from PIL import Image as PILImage
+        processed_images = []
+        if image is not None:
+            img_list = image if isinstance(image, list) else [image]
+            for idx, img in enumerate(img_list):
+                if hasattr(img, 'shape') and len(img.shape) == 4:
+                    # BCHW tensor with values 0-1 -> convert to PIL
+                    # Remove batch dim, convert to HWC, scale to 0-255
+                    img_np = img[0].permute(1, 2, 0).float().cpu().numpy()  # CHW -> HWC
+                    img_np = (img_np * 255).clip(0, 255).astype('uint8')
+                    pil_img = PILImage.fromarray(img_np)
+                    processed_images.append(pil_img)
+                    print(f"[PIPELINE] Image {idx} converted to PIL: size={pil_img.size}")
+                else:
+                    processed_images.append(img)
+                    print(f"[PIPELINE] Image {idx} passed through: type={type(img)}")
+
+        images_for_processor = processed_images if len(processed_images) > 0 else None
+
+        model_inputs = self.processor(
+            text=txt,
+            images=images_for_processor,
+            padding=True,
+            return_tensors="pt",
+        ).to(device)
+
+        # DYNAMIC TEMPLATE END DETECTION (matches ComfyUI)
+        drop_idx = self._find_template_end(model_inputs.input_ids)
+        print(f"[PIPELINE] Dynamic drop_idx: {drop_idx} (diffusers default was 64)")
+        print(f"[PIPELINE] model_inputs keys: {model_inputs.keys()}")
+        print(f"[PIPELINE] input_ids shape: {model_inputs.input_ids.shape}")
+        if hasattr(model_inputs, 'pixel_values') and model_inputs.pixel_values is not None:
+            print(f"[PIPELINE] pixel_values shape: {model_inputs.pixel_values.shape}, dtype: {model_inputs.pixel_values.dtype}")
+            print(f"[PIPELINE] pixel_values range: [{model_inputs.pixel_values.min():.3f}, {model_inputs.pixel_values.max():.3f}]")
+        if hasattr(model_inputs, 'image_grid_thw') and model_inputs.image_grid_thw is not None:
+            print(f"[PIPELINE] image_grid_thw: {model_inputs.image_grid_thw}")
+
+        outputs = self.text_encoder(
+            input_ids=model_inputs.input_ids,
+            attention_mask=model_inputs.attention_mask,
+            pixel_values=model_inputs.pixel_values,
+            image_grid_thw=model_inputs.image_grid_thw,
+            output_hidden_states=True,
+        )
+
+        hidden_states = outputs.hidden_states[-1]
+        split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
+        split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+        max_seq_len = max([e.size(0) for e in split_hidden_states])
+        prompt_embeds = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+        )
+        encoder_attention_mask = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
+        )
+
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+        return prompt_embeds, encoder_attention_mask
+
     @torch.no_grad()
     def __call__(
         self,

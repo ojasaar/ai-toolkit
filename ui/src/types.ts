@@ -84,6 +84,7 @@ export interface DatasetConfig {
   folder_path: string;
   mask_path: string | null;
   mask_min_value: number;
+  mask_secondary_value: number;
   default_caption: string;
   caption_ext: string;
   caption_dropout_rate: number;

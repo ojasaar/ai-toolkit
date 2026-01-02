@@ -147,6 +147,7 @@ class DataLoaderBatchDTO:
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
             self.mask_tensor: Union[torch.Tensor, None] = None
+            self.mask_zone_info: Union[dict, None] = None  # Zone percentages for RGB masks (for logging)
             self.unaugmented_tensor: Union[torch.Tensor, None] = None
             self.unconditional_tensor: Union[torch.Tensor, None] = None
             self.unconditional_latents: Union[torch.Tensor, None] = None
@@ -236,6 +237,19 @@ class DataLoaderBatchDTO:
                     else:
                         mask_tensors.append(x.mask_tensor)
                 self.mask_tensor = torch.cat([x.unsqueeze(0) for x in mask_tensors])
+
+                # Collect zone info from RGB masks for logging
+                self.mask_zone_info = None
+                rgb_count = sum(1 for x in self.file_items if getattr(x, '_is_rgb_mask', False))
+                zone_count = sum(1 for x in self.file_items if getattr(x, '_zone_info', None) is not None)
+                if rgb_count > 0 or zone_count > 0:
+                    print(f"[DEBUG] Batch has {len(self.file_items)} items, {rgb_count} RGB masks, {zone_count} with zone_info")
+                for x in self.file_items:
+                    is_rgb = getattr(x, '_is_rgb_mask', False)
+                    zone_info = getattr(x, '_zone_info', None)
+                    if is_rgb and zone_info is not None:
+                        self.mask_zone_info = zone_info
+                        break
 
             # add unaugmented tensors for ones with augments
             if any([x.unaugmented_tensor is not None for x in self.file_items]):

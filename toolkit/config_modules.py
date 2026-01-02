@@ -888,7 +888,8 @@ class DatasetConfig:
         self.unconditional_path: str = kwargs.get('unconditional_path',
                                                   None)  # path where matching unconditional images are located
         self.invert_mask: bool = kwargs.get('invert_mask', False)  # invert mask
-        self.mask_min_value: float = kwargs.get('mask_min_value', 0.0)  # min value for . 0 - 1
+        self.mask_min_value: float = kwargs.get('mask_min_value', 0.0)  # min value for background zone, 0-1
+        self.mask_secondary_value: float = kwargs.get('mask_secondary_value', 0.5)  # weight for secondary (green) zone in RGB masks, 0-1
         self.poi: Union[str, None] = kwargs.get('poi',
                                                 None)  # if one is set and in json data, will be used as auto crop scale point of interes
         self.use_short_captions: bool = kwargs.get('use_short_captions', False)  # if true, will use 'caption_short' from json

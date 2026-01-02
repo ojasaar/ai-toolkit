@@ -1290,6 +1290,9 @@ class MaskFileItemDTOMixin:
         self.use_alpha_as_mask: bool = False
         dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
         self.mask_min_value = dataset_config.mask_min_value
+        self.mask_secondary_value = dataset_config.mask_secondary_value
+        self._is_rgb_mask = False  # Track if this is an RGB multi-zone mask
+        self._zone_info = None  # Store zone percentages for logging
         if dataset_config.alpha_mask:
             self.use_alpha_as_mask = True
             self.mask_path = kwargs.get('path', None)
@@ -1357,8 +1360,50 @@ class MaskFileItemDTOMixin:
         blur_radius = int(min_size * random.random() * 0.005)
         img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-        # make grayscale
-        img = img.convert('L')
+        # Detect if this is an RGB multi-zone mask or a grayscale mask
+        np_img = np.array(img)  # img is RGB at this point
+        red_channel = np_img[:, :, 0].astype(np.float32)
+        green_channel = np_img[:, :, 1].astype(np.float32)
+        blue_channel = np_img[:, :, 2].astype(np.float32)
+
+        # Check if channels differ significantly (threshold handles JPEG compression artifacts)
+        channel_diff_rg = np.abs(red_channel - green_channel).mean()
+        channel_diff_rb = np.abs(red_channel - blue_channel).mean()
+        self._is_rgb_mask = (channel_diff_rg > 5.0) or (channel_diff_rb > 5.0)
+
+        if self._is_rgb_mask:
+            # Process as multi-zone RGB mask
+            # Normalize channels to 0-1 range
+            red_norm = red_channel / 255.0
+            green_norm = green_channel / 255.0
+
+            # Create zone masks with 50% threshold
+            # Priority: Red > Green > Background
+            red_zone = red_norm > 0.5
+            green_zone = (green_norm > 0.5) & (red_norm <= 0.5)  # Green only where red not dominant
+
+            # Store zone info for logging
+            red_pct = (red_zone.sum() / red_zone.size) * 100
+            green_pct = (green_zone.sum() / green_zone.size) * 100
+            bg_pct = 100 - red_pct - green_pct
+            self._zone_info = {
+                'red_pct': red_pct,
+                'green_pct': green_pct,
+                'bg_pct': bg_pct,
+            }
+            print_acc(f"RGB mask detected: primary={red_pct:.1f}% (1.0), secondary={green_pct:.1f}% ({self.mask_secondary_value}), bg={bg_pct:.1f}% ({self.mask_min_value})")
+
+            # Build weighted mask
+            mask_weights = np.full(red_norm.shape, self.mask_min_value, dtype=np.float32)
+            mask_weights[green_zone] = self.mask_secondary_value
+            mask_weights[red_zone] = 1.0
+
+            # Convert to grayscale PIL image (scale to 0-255 for PIL compatibility)
+            mask_weights_255 = (mask_weights * 255.0).astype(np.uint8)
+            img = Image.fromarray(mask_weights_255, mode='L')
+        else:
+            # Traditional grayscale conversion for non-RGB masks
+            img = img.convert('L')
 
         if self.dataset_config.buckets:
             # scale and crop based on file item
@@ -1381,8 +1426,14 @@ class MaskFileItemDTOMixin:
             self.mask_tensor = self.augment_spatial_control(img, transform=transform)
         else:
             self.mask_tensor = transform(img)
-        self.mask_tensor = value_map(self.mask_tensor, 0, 1.0, self.mask_min_value, 1.0)
-        # convert to grayscale
+
+        if self._is_rgb_mask:
+            # For RGB masks, weights are already pre-applied in the correct range
+            # ToTensor converts 0-255 back to 0-1, so our weights are preserved
+            pass
+        else:
+            # For grayscale masks, apply traditional value remapping
+            self.mask_tensor = value_map(self.mask_tensor, 0, 1.0, self.mask_min_value, 1.0)
 
     def cleanup_mask(self: 'FileItemDTO'):
         self.mask_tensor = None

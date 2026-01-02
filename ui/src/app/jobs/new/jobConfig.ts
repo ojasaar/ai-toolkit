@@ -4,6 +4,7 @@ export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
   mask_path: null,
   mask_min_value: 0.1,
+  mask_secondary_value: 0.5,
   default_caption: '',
   caption_ext: 'txt',
   caption_dropout_rate: 0.05,

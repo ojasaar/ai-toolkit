@@ -114,6 +114,9 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
 
+        # Counter for periodic RGB mask loss logging
+        self._mask_loss_log_counter: int = 0
+
 
     def before_model_load(self):
         pass
@@ -913,6 +916,23 @@ class SDTrainer(BaseSDTrainProcess):
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
         loss = loss.mean()
+
+        # Periodic logging for RGB mask zone loss breakdown
+        self._mask_loss_log_counter += 1
+        if self._mask_loss_log_counter % 50 == 0:
+            has_mask = batch.mask_tensor is not None
+            has_zone_info = getattr(batch, 'mask_zone_info', None) is not None
+            if has_zone_info:
+                zone_info = batch.mask_zone_info
+                print_acc(
+                    f"[Step {self._mask_loss_log_counter}] RGB mask zones - "
+                    f"primary: {zone_info['red_pct']:.1f}%, "
+                    f"secondary: {zone_info['green_pct']:.1f}%, "
+                    f"bg: {zone_info['bg_pct']:.1f}% | "
+                    f"loss: {loss.item():.4f}"
+                )
+            elif has_mask:
+                print_acc(f"[Step {self._mask_loss_log_counter}] Grayscale mask | loss: {loss.item():.4f}")
 
         # check for additional losses
         if self.adapter is not None and hasattr(self.adapter, "additional_loss") and self.adapter.additional_loss is not None:
