@@ -886,6 +886,11 @@ class SDTrainer(BaseSDTrainProcess):
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
         loss = loss.mean()
+        
+        # check for audio loss
+        if batch.audio_pred is not None and batch.audio_target is not None:
+            audio_loss = torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean")
+            loss = loss + audio_loss
 
         # Periodic logging for RGB mask zone loss breakdown
         self._mask_loss_log_counter += 1
